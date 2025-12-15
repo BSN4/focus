@@ -128,6 +128,9 @@ final class WindowManager {
     private func getWindows(for appElement: AXUIElement) -> [AXUIElement]? {
         var value: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value)
+        if result != .success {
+            print("[Focus] AX error: \(result.rawValue)")
+        }
         guard result == .success else { return nil }
         return value as? [AXUIElement]
     }

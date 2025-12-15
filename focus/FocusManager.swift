@@ -53,14 +53,25 @@ final class FocusManager {
     // MARK: App Activation Handler
 
     @objc private func handleAppActivation(_ notification: Notification) {
-        guard isEnabled else { return }
-
-        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
+        print("[Focus] App activation detected")
+        guard isEnabled else {
+            print("[Focus] Disabled, skipping")
             return
         }
 
-        guard shouldProcessApp(app) else { return }
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
+            print("[Focus] Could not get app from notification")
+            return
+        }
 
+        print("[Focus] Activated: \(app.localizedName ?? "unknown")")
+
+        guard shouldProcessApp(app) else {
+            print("[Focus] App filtered out by shouldProcessApp")
+            return
+        }
+
+        print("[Focus] Processing app switch...")
         debounceAndProcess(app)
     }
 
@@ -69,21 +80,34 @@ final class FocusManager {
     private func shouldProcessApp(_ app: NSRunningApplication) -> Bool {
         // Ignore self
         if app.bundleIdentifier == Bundle.main.bundleIdentifier {
+            print("[Focus] Filtered: is self")
+            return false
+        }
+
+        // Ignore non-regular apps (SecurityAgent, Spotlight, system dialogs, menu bar apps)
+        if app.activationPolicy != .regular {
+            print("[Focus] Filtered: not a regular app (policy: \(app.activationPolicy.rawValue))")
             return false
         }
 
         // Ignore excluded apps
         if let bundleId = app.bundleIdentifier, excludedApps.contains(bundleId) {
+            print("[Focus] Filtered: excluded app")
             return false
         }
 
+        let hasWindows = windowManager.hasWindows(for: app)
+        print("[Focus] hasWindows for \(app.localizedName ?? "?"): \(hasWindows)")
+
         // Ignore Finder desktop (Finder with no windows = desktop click)
-        if app.bundleIdentifier == "com.apple.finder", !windowManager.hasWindows(for: app) {
+        if app.bundleIdentifier == "com.apple.finder", !hasWindows {
+            print("[Focus] Filtered: Finder desktop")
             return false
         }
 
         // Ignore menu bar apps and apps without windows
-        if !windowManager.hasWindows(for: app) {
+        if !hasWindows {
+            print("[Focus] Filtered: no windows")
             return false
         }
 
@@ -113,7 +137,8 @@ final class FocusManager {
     private func hideOtherApps(except activeApp: NSRunningApplication) {
         for app in NSWorkspace.shared.runningApplications {
             guard shouldHideApp(app, activeApp: activeApp) else { continue }
-            app.hide()
+            let result = app.hide()
+            print("[Focus] Hiding \(app.localizedName ?? "unknown"): \(result ? "success" : "FAILED")")
         }
     }
 
