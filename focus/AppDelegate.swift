@@ -32,6 +32,7 @@ private enum DefaultsKey {
     static let centerOnly = "centerOnly"
     static let sizePreset = "sizePreset"
     static let excludedApps = "excludedApps"
+    static let appShortcuts = "appShortcuts"
 }
 
 // MARK: - App Delegate
@@ -46,7 +47,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var centerOnlyMenuItem: NSMenuItem!
     private var launchAtLoginMenuItem: NSMenuItem!
     private var excludedAppsMenuItem: NSMenuItem!
+    private var appShortcutsMenuItem: NSMenuItem!
     private var sizeMenuItems: [WindowSizePreset: NSMenuItem] = [:]
+    private var appShortcutsController: AppShortcutsController?
+    private var excludedAppsController: ExcludedAppsController?
 
     // MARK: Persisted Settings
 
@@ -113,6 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerDefaults()
         setupStatusItem()
         setupFocusManager()
+        setupShortcutManager()
         requestAccessibilityPermission()
     }
 
@@ -134,6 +139,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         focusManager.windowSize = sizePreset.size
         focusManager.excludedApps = excludedApps
         focusManager.start()
+    }
+
+    private func setupShortcutManager() {
+        ShortcutManager.shared.start()
     }
 
     private func setupStatusItem() {
@@ -161,54 +170,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.delegate = self
 
-        // Enabled toggle
-        enabledMenuItem = NSMenuItem(
-            title: "Enabled",
-            action: #selector(toggleEnabled),
-            keyEquivalent: ""
-        )
+        addEnabledToggle(to: menu)
+        menu.addItem(.separator())
+        addWindowSizeSubmenu(to: menu)
+        addCenterOnlyToggle(to: menu)
+        menu.addItem(.separator())
+        addExcludedAppsSubmenu(to: menu)
+        addAppShortcutsSubmenu(to: menu)
+        menu.addItem(.separator())
+        addLaunchAtLoginToggle(to: menu)
+        menu.addItem(.separator())
+        addQuitItem(to: menu)
+
+        return menu
+    }
+
+    private func addEnabledToggle(to menu: NSMenu) {
+        enabledMenuItem = NSMenuItem(title: "Enabled", action: #selector(toggleEnabled), keyEquivalent: "")
         enabledMenuItem.target = self
         menu.addItem(enabledMenuItem)
+    }
 
-        menu.addItem(.separator())
-
-        // Window size submenu
+    private func addWindowSizeSubmenu(to menu: NSMenu) {
         let sizeMenu = NSMenu()
         for preset in WindowSizePreset.allCases {
-            let item = NSMenuItem(
-                title: preset.rawValue,
-                action: #selector(selectSizePreset(_:)),
-                keyEquivalent: ""
-            )
+            let item = NSMenuItem(title: preset.rawValue, action: #selector(selectSizePreset(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = preset
             sizeMenuItems[preset] = item
             sizeMenu.addItem(item)
         }
-
         let sizeMenuItem = NSMenuItem(title: "Window Size", action: nil, keyEquivalent: "")
         sizeMenuItem.submenu = sizeMenu
         menu.addItem(sizeMenuItem)
+    }
 
-        // Center only toggle
-        centerOnlyMenuItem = NSMenuItem(
-            title: "Center Only",
-            action: #selector(toggleCenterOnly),
-            keyEquivalent: ""
-        )
+    private func addCenterOnlyToggle(to menu: NSMenu) {
+        centerOnlyMenuItem = NSMenuItem(title: "Center Only", action: #selector(toggleCenterOnly), keyEquivalent: "")
         centerOnlyMenuItem.target = self
         menu.addItem(centerOnlyMenuItem)
+    }
 
-        menu.addItem(.separator())
-
-        // Excluded apps submenu
+    private func addExcludedAppsSubmenu(to menu: NSMenu) {
         excludedAppsMenuItem = NSMenuItem(title: "Excluded Apps", action: nil, keyEquivalent: "")
-        excludedAppsMenuItem.submenu = NSMenu()
+        let excludedSubmenu = NSMenu()
+        excludedAppsMenuItem.submenu = excludedSubmenu
+        excludedAppsController = ExcludedAppsController(menu: excludedSubmenu)
+        excludedAppsController?.delegate = self
         menu.addItem(excludedAppsMenuItem)
+    }
 
-        menu.addItem(.separator())
+    private func addAppShortcutsSubmenu(to menu: NSMenu) {
+        appShortcutsMenuItem = NSMenuItem(title: "App Shortcuts", action: nil, keyEquivalent: "")
+        let shortcutsSubmenu = NSMenu()
+        appShortcutsMenuItem.submenu = shortcutsSubmenu
+        appShortcutsController = AppShortcutsController(menu: shortcutsSubmenu)
+        menu.addItem(appShortcutsMenuItem)
+    }
 
-        // Launch at login
+    private func addLaunchAtLoginToggle(to menu: NSMenu) {
         launchAtLoginMenuItem = NSMenuItem(
             title: "Launch at Login",
             action: #selector(toggleLaunchAtLogin),
@@ -216,19 +236,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         launchAtLoginMenuItem.target = self
         menu.addItem(launchAtLoginMenuItem)
+    }
 
-        menu.addItem(.separator())
-
-        // Quit
-        let quitItem = NSMenuItem(
-            title: "Quit Focus",
-            action: #selector(quit),
-            keyEquivalent: "q"
-        )
+    private func addQuitItem(to menu: NSMenu) {
+        let quitItem = NSMenuItem(title: "Quit Focus", action: #selector(quit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
-
-        return menu
     }
 
     private func updateMenuState() {
@@ -238,57 +251,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         for (preset, item) in sizeMenuItems {
             item.state = preset == sizePreset ? .on : .off
-        }
-    }
-
-    private func rebuildExcludedAppsMenu() {
-        guard let submenu = excludedAppsMenuItem?.submenu else { return }
-        submenu.removeAllItems()
-
-        // Get running regular apps (excluding self)
-        let runningApps = NSWorkspace.shared.runningApplications
-            .filter { $0.activationPolicy == .regular }
-            .filter { $0.bundleIdentifier != Bundle.main.bundleIdentifier }
-            .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
-
-        if runningApps.isEmpty {
-            let noAppsItem = NSMenuItem(title: "No apps running", action: nil, keyEquivalent: "")
-            noAppsItem.isEnabled = false
-            submenu.addItem(noAppsItem)
-            return
-        }
-
-        for app in runningApps {
-            guard let bundleId = app.bundleIdentifier else { continue }
-
-            let item = NSMenuItem(
-                title: app.localizedName ?? bundleId,
-                action: #selector(toggleExcludedApp(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.representedObject = bundleId
-            item.state = excludedApps.contains(bundleId) ? .on : .off
-
-            // Add app icon if available
-            if let icon = app.icon {
-                icon.size = NSSize(width: 16, height: 16)
-                item.image = icon
-            }
-
-            submenu.addItem(item)
-        }
-
-        // Add separator and clear option if there are exclusions
-        if !excludedApps.isEmpty {
-            submenu.addItem(.separator())
-            let clearItem = NSMenuItem(
-                title: "Clear All Exclusions",
-                action: #selector(clearExcludedApps),
-                keyEquivalent: ""
-            )
-            clearItem.target = self
-            submenu.addItem(clearItem)
         }
     }
 
@@ -346,22 +308,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sizePreset = preset
     }
 
-    @objc private func toggleExcludedApp(_ sender: NSMenuItem) {
-        guard let bundleId = sender.representedObject as? String else { return }
-
-        var current = excludedApps
-        if current.contains(bundleId) {
-            current.remove(bundleId)
-        } else {
-            current.insert(bundleId)
-        }
-        excludedApps = current
-    }
-
-    @objc private func clearExcludedApps() {
-        excludedApps = []
-    }
-
     @objc private func quit() {
         NSApplication.shared.terminate(nil)
     }
@@ -371,7 +317,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
-        // Rebuild excluded apps menu when menu opens to show current running apps
-        rebuildExcludedAppsMenu()
+        excludedAppsController?.rebuildMenu()
+        appShortcutsController?.rebuildMenu()
+    }
+}
+
+// MARK: - ExcludedAppsControllerDelegate
+
+extension AppDelegate: ExcludedAppsControllerDelegate {
+    func excludedAppsDidChange(_ newExcludedApps: Set<String>) {
+        excludedApps = newExcludedApps
+    }
+
+    func currentExcludedApps() -> Set<String> {
+        excludedApps
     }
 }

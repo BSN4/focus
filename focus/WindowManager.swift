@@ -110,7 +110,7 @@ final class WindowManager {
             finalSize = CGSize(
                 width: min(size.width, visibleFrame.width),
                 height: min(size.height, visibleFrame.height),
-            )
+                )
             setSize(of: window, to: finalSize)
         }
 
