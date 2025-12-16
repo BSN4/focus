@@ -107,6 +107,13 @@ struct AppShortcut: Codable {
     let keyCombo: KeyCombo
 }
 
+// MARK: - Hotkey ID
+
+private struct HotkeyID {
+    let signature: OSType
+    let id: UInt32
+}
+
 // MARK: - Shortcut Manager
 
 final class ShortcutManager {
@@ -117,8 +124,10 @@ final class ShortcutManager {
     // MARK: Properties
 
     private var shortcuts: [String: KeyCombo] = [:]
-    private var globalMonitor: Any?
-    private var localMonitor: Any?
+    private var hotkeyRefs: [String: EventHotKeyRef] = [:]
+    private var hotkeyIdToBundle: [UInt32: String] = [:]
+    private var nextHotkeyId: UInt32 = 1
+    private var eventHandler: EventHandlerRef?
 
     // MARK: Callbacks
 
@@ -126,28 +135,41 @@ final class ShortcutManager {
 
     // MARK: Initialization
 
-    private init() {}
+    private init() {
+        installEventHandler()
+    }
+
+    deinit {
+        unregisterAllHotkeys()
+        if let handler = eventHandler {
+            RemoveEventHandler(handler)
+        }
+    }
 
     // MARK: Public API
 
     func start() {
         loadShortcuts()
-        registerGlobalMonitor()
+        registerAllHotkeys()
     }
 
     func stop() {
-        unregisterMonitors()
+        unregisterAllHotkeys()
     }
 
     func setShortcut(_ keyCombo: KeyCombo?, for bundleId: String) {
+        // Unregister old hotkey if exists
+        unregisterHotkey(for: bundleId)
+
         if let keyCombo = keyCombo {
             // Remove any existing shortcut with the same key combo
             for (existingBundleId, existingCombo) in shortcuts {
-                if existingCombo == keyCombo && existingBundleId != bundleId {
-                    shortcuts.removeValue(forKey: existingBundleId)
-                }
+                guard existingCombo == keyCombo && existingBundleId != bundleId else { continue }
+                unregisterHotkey(for: existingBundleId)
+                shortcuts.removeValue(forKey: existingBundleId)
             }
             shortcuts[bundleId] = keyCombo
+            registerHotkey(for: bundleId, keyCombo: keyCombo)
         } else {
             shortcuts.removeValue(forKey: bundleId)
         }
@@ -163,15 +185,15 @@ final class ShortcutManager {
     }
 
     func clearAllShortcuts() {
+        unregisterAllHotkeys()
         shortcuts.removeAll()
         saveShortcuts()
     }
 
     func isKeyComboInUse(_ keyCombo: KeyCombo, excludingBundleId: String? = nil) -> String? {
         for (existingBundleId, existingCombo) in shortcuts {
-            if existingCombo == keyCombo && existingBundleId != excludingBundleId {
-                return existingBundleId
-            }
+            guard existingCombo == keyCombo && existingBundleId != excludingBundleId else { continue }
+            return existingBundleId
         }
         return nil
     }
@@ -197,40 +219,101 @@ final class ShortcutManager {
         print("[ShortcutManager] Saved \(shortcuts.count) shortcuts")
     }
 
-    // MARK: Global Event Monitoring
+    // MARK: Carbon Hotkey Registration
 
-    private func registerGlobalMonitor() {
-        unregisterMonitors()
+    private func installEventHandler() {
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
 
-        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            self?.handleKeyEvent(event)
+        let handler: EventHandlerUPP = { _, event, userData -> OSStatus in
+            guard let userData = userData else { return OSStatus(eventNotHandledErr) }
+            let manager = Unmanaged<ShortcutManager>.fromOpaque(userData).takeUnretainedValue()
+            manager.handleHotkeyEvent(event)
+            return noErr
         }
 
-        localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            self?.handleKeyEvent(event)
-            return event
-        }
-
-        print("[ShortcutManager] Global monitor registered")
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        InstallEventHandler(GetEventDispatcherTarget(), handler, 1, &eventType, selfPtr, &eventHandler)
+        print("[ShortcutManager] Carbon event handler installed")
     }
 
-    private func unregisterMonitors() {
-        if let monitor = globalMonitor {
-            NSEvent.removeMonitor(monitor)
-            globalMonitor = nil
-        }
-        if let monitor = localMonitor {
-            NSEvent.removeMonitor(monitor)
-            localMonitor = nil
+    private func registerAllHotkeys() {
+        for (bundleId, keyCombo) in shortcuts {
+            registerHotkey(for: bundleId, keyCombo: keyCombo)
         }
     }
 
-    private func handleKeyEvent(_ event: NSEvent) {
-        guard let keyCombo = KeyCombo.from(event: event) else { return }
+    private func registerHotkey(for bundleId: String, keyCombo: KeyCombo) {
+        let hotkeyId = nextHotkeyId
+        nextHotkeyId += 1
 
-        guard let bundleId = shortcuts.first(where: { $0.value == keyCombo })?.key else { return }
-        print("[ShortcutManager] Shortcut triggered for: \(bundleId)")
-        activateApp(bundleId: bundleId)
+        var hotKeyID = EventHotKeyID(signature: OSType(0x464F4355), id: hotkeyId) // 'FOCU'
+        var hotKeyRef: EventHotKeyRef?
+
+        let modifiers = carbonModifiers(from: keyCombo)
+        let status = RegisterEventHotKey(
+            UInt32(keyCombo.keyCode),
+            modifiers,
+            hotKeyID,
+            GetEventDispatcherTarget(),
+            0,
+            &hotKeyRef
+        )
+
+        if status == noErr, let ref = hotKeyRef {
+            hotkeyRefs[bundleId] = ref
+            hotkeyIdToBundle[hotkeyId] = bundleId
+            print("[ShortcutManager] Registered hotkey \(keyCombo.displayString) for \(bundleId)")
+        } else {
+            print("[ShortcutManager] Failed to register hotkey: \(status)")
+        }
+    }
+
+    private func unregisterHotkey(for bundleId: String) {
+        guard let ref = hotkeyRefs[bundleId] else { return }
+        UnregisterEventHotKey(ref)
+        hotkeyRefs.removeValue(forKey: bundleId)
+        hotkeyIdToBundle = hotkeyIdToBundle.filter { $0.value != bundleId }
+        print("[ShortcutManager] Unregistered hotkey for \(bundleId)")
+    }
+
+    private func unregisterAllHotkeys() {
+        for (_, ref) in hotkeyRefs {
+            UnregisterEventHotKey(ref)
+        }
+        hotkeyRefs.removeAll()
+        hotkeyIdToBundle.removeAll()
+    }
+
+    private func carbonModifiers(from keyCombo: KeyCombo) -> UInt32 {
+        var modifiers: UInt32 = 0
+        if keyCombo.hasCommand { modifiers |= UInt32(cmdKey) }
+        if keyCombo.hasOption { modifiers |= UInt32(optionKey) }
+        if keyCombo.hasControl { modifiers |= UInt32(controlKey) }
+        if keyCombo.hasShift { modifiers |= UInt32(shiftKey) }
+        return modifiers
+    }
+
+    private func handleHotkeyEvent(_ event: EventRef?) {
+        guard let event = event else { return }
+
+        var hotKeyID = EventHotKeyID()
+        let status = GetEventParameter(
+            event,
+            UInt32(kEventParamDirectObject),
+            UInt32(typeEventHotKeyID),
+            nil,
+            MemoryLayout<EventHotKeyID>.size,
+            nil,
+            &hotKeyID
+        )
+
+        guard status == noErr else { return }
+        guard let bundleId = hotkeyIdToBundle[hotKeyID.id] else { return }
+
+        print("[ShortcutManager] Hotkey triggered for: \(bundleId)")
+        DispatchQueue.main.async {
+            self.activateApp(bundleId: bundleId)
+        }
     }
 
     // MARK: App Activation
